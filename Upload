@@ -390,5 +390,3 @@ def _connect_to_synapse(connection_string: str) -> "pyodbc.Connection":
     return pyodbc.connect(
         connection_string, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct}
     )
- 
- 
