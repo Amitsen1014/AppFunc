@@ -1,0 +1,394 @@
+import json
+import logging
+import os
+import struct
+ 
+import azure.functions as func
+import pyodbc
+from azure.identity import DefaultAzureCredential
+from dotenv import load_dotenv
+ 
+# Import local modules
+from src.generate_ddl import generate_create_view_ddl
+from src.utils import merge_staging_to_production, process_upload_to_staging
+from src.query_manager import check_and_store_query
+ 
+# Load environment variables from .env file for local development
+load_dotenv()
+ 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+ 
+# Set Azure SDK loggers to WARNING to suppress verbose request/response logs
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(
+    logging.WARNING
+)
+logging.getLogger("azure.storage.blob").setLevel(logging.WARNING)
+ 
+ 
+# Initialize the Function App
+app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+ 
+ 
+@app.function_name(name="process_upload")
+@app.route(route="process_upload", methods=["POST"])
+def process_upload(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    HTTP endpoint for the Upload to Staging pipeline.
+    This function enriches raw data and then creates/updates the
+    corresponding Synapse view for the staging table.
+    """
+    logging.info("Upload to Staging pipeline triggered.")
+    try:
+        req_body = req.get_json()
+        upload_path = req_body.get("uploadPath")
+        staging_path = req_body.get("stagingPath")
+        staging_table_name = req_body.get("stagingTableName")
+        data_source = req_body.get("dataSource")
+        pk_column = req_body.get(
+            "pkColumn", "Id"
+        )  # Default to "Id" for backward compatibility
+        time = req_body.get("time")  # Optional
+ 
+        required_params = [upload_path, staging_path, staging_table_name, data_source]
+        if not all(required_params):
+            return func.HttpResponse(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "message": "Missing required parameters: 'uploadPath', 'stagingPath', 'stagingTableName', 'dataSource'",
+                    }
+                ),
+                status_code=400,
+                mimetype="application/json",
+            )
+ 
+        # --- Step 1: Process Upload to Staging ---
+        logging.info("--- Step 1: Processing upload to staging ---")
+        staging_result = process_upload_to_staging(
+            upload_path=upload_path,
+            staging_path=staging_path,
+            pk_column=pk_column,
+            time=time,
+        )
+        if staging_result.get("status") != "success":
+            return func.HttpResponse(
+                json.dumps({"step": "process_upload", "result": staging_result}),
+                status_code=500,
+                mimetype="application/json",
+            )
+ 
+        # If the staging step found no files, we can end here successfully.
+        if "No files found to process" in staging_result.get("message", ""):
+            logging.info("Staging step reported no new files. Skipping DDL generation.")
+            return func.HttpResponse(
+                json.dumps(
+                    {
+                        "status": "success",
+                        "message": "Pipeline completed successfully; no new data to process.",
+                        "stagingResult": staging_result,
+                    }
+                ),
+                status_code=200,
+                mimetype="application/json",
+            )
+ 
+        # If no files were found, the process is complete for this item.
+        # Skip DDL generation as there's nothing to create a view over.
+        if staging_result.get("message") == "No files found to process.":
+            logging.info(
+                "No new files were found in upload path. Skipping DDL generation."
+            )
+            return func.HttpResponse(
+                json.dumps(
+                    {
+                        "status": "success_no_files",
+                        "stagingResult": staging_result,
+                        "stagingDdlResult": {
+                            "status": "skipped",
+                            "message": "No files to process.",
+                        },
+                    }
+                ),
+                status_code=200,
+                mimetype="application/json",
+            )
+ 
+        # --- Step 2: DDL for Staging Table ---
+        logging.info("--- Step 2: Running DDL for staging table ---")
+        staging_ddl_result = _run_ddl_logic(
+            table_path=staging_path,
+            table_name=staging_table_name,
+            data_source=data_source,
+            format="PARQUET",
+        )
+ 
+        final_result = {
+            "status": "success"
+            if staging_ddl_result.get("status") == "success"
+            else "error",
+            "stagingResult": staging_result,
+            "stagingDdlResult": staging_ddl_result,
+        }
+        status_code = 200 if final_result["status"] == "success" else 500
+        return func.HttpResponse(
+            json.dumps(final_result),
+            status_code=status_code,
+            mimetype="application/json",
+        )
+ 
+    except Exception as e:
+        logger.error(
+            f"An unexpected error occurred in process_upload: {e}", exc_info=True
+        )
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": str(e)}),
+            status_code=500,
+            mimetype="application/json",
+        )
+ 
+ 
+@app.function_name(name="merge_to_production")
+@app.route(route="merge_to_production", methods=["POST"])
+def merge_to_production(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    HTTP endpoint for the Staging to Production pipeline.
+    This function runs the SCD2 merge logic and then creates/updates the
+    corresponding Synapse views for the production table.
+    """
+    logging.info("Staging to Production pipeline triggered.")
+    try:
+        req_body = req.get_json()
+        staging_path = req_body.get("stagingPath")
+        production_path = req_body.get("productionPath")
+        production_table_name = req_body.get("productionTableName")
+        data_source = req_body.get("dataSource")
+        time = req_body.get("time")  # Optional
+ 
+        required_params = [
+            staging_path,
+            production_path,
+            production_table_name,
+            data_source,
+        ]
+        if not all(required_params):
+            return func.HttpResponse(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "message": "Missing required parameters: 'stagingPath', 'productionPath', 'productionTableName', 'dataSource'",
+                    }
+                ),
+                status_code=400,
+                mimetype="application/json",
+            )
+ 
+        # --- Step 1: Merge Staging to Production ---
+        logging.info("--- Step 1: Merging staging to production ---")
+        merge_result = merge_staging_to_production(
+            staging_path=staging_path,
+            production_path=production_path,
+            pk="Id",
+            hash_col="row_hash",
+            time=time,
+        )
+        if merge_result.get("status") != "success":
+            return func.HttpResponse(
+                json.dumps({"step": "merge_to_production", "result": merge_result}),
+                status_code=500,
+                mimetype="application/json",
+            )
+ 
+        # --- Step 2: DDL for Production Table ---
+        logging.info("--- Step 2: Running DDL for production table ---")
+        production_ddl_result = _run_ddl_logic(
+            table_path=production_path,
+            table_name=production_table_name,
+            data_source=data_source,
+            format="DELTA",
+        )
+ 
+        final_result = {
+            "status": "success"
+            if production_ddl_result.get("status") == "success"
+            else "error",
+            "mergeResult": merge_result,
+            "productionDdlResult": production_ddl_result,
+        }
+        status_code = 200 if final_result["status"] == "success" else 500
+        return func.HttpResponse(
+            json.dumps(final_result),
+            status_code=status_code,
+            mimetype="application/json",
+        )
+ 
+    except Exception as e:
+        logger.error(
+            f"An unexpected error occurred in merge_to_production: {e}", exc_info=True
+        )
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": str(e)}),
+            status_code=500,
+            mimetype="application/json",
+        )
+ 
+ 
+@app.function_name(name="check_query_change")
+@app.route(route="check_query_change", methods=["POST"])
+def check_query_change(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    HTTP endpoint to check for query changes. This function always returns 200 OK.
+    The response body contains a flag to tell ADF whether to run an incremental load.
+    """
+    logging.info("Query change check triggered.")
+    try:
+        # Leniently parse the body to handle ADF's potential malformed JSON
+        try:
+            body_text = req.get_body().decode("utf-8")
+            req_body = json.loads(body_text, strict=False)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logging.error(f"Failed to decode JSON body: {e}", exc_info=True)
+            raise ValueError("HTTP request does not contain valid JSON data.") from e
+ 
+        dataset_name = req_body.get("dataset_name")
+        environment = req_body.get("environment", "production")
+        query = req_body.get("query")
+ 
+        if not all([dataset_name, query]):
+            return func.HttpResponse(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "message": "Missing required parameters: 'dataset_name', 'query'",
+                    }
+                ),
+                status_code=400,
+                mimetype="application/json",
+            )
+ 
+        result = check_and_store_query(dataset_name, environment, query)
+ 
+        # If the underlying function returned a hard error (e.g. missing config), bubble it up as a 500
+        if result.get("status") == "error":
+            return func.HttpResponse(
+                json.dumps(result), status_code=500, mimetype="application/json"
+            )
+ 
+        # Otherwise, always return 200 OK with the result from the query manager
+        return func.HttpResponse(
+            json.dumps(result),
+            status_code=200,
+            mimetype="application/json",
+        )
+ 
+    except Exception as e:
+        logger.error(
+            f"An unexpected error occurred in check_query_change: {e}", exc_info=True
+        )
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": str(e)}),
+            status_code=500,
+            mimetype="application/json",
+        )
+ 
+ 
+def _run_ddl_logic(
+    table_path: str, table_name: str, data_source: str, format: str
+) -> dict:
+    """
+    Generates and executes the DDL for a Synapse view using OPENROWSET.
+    Also creates a `current=1` view if the table name ends in `_all`.
+    """
+    try:
+        ddl_result = generate_create_view_ddl(
+            table_path=table_path,
+            table_name=table_name,
+            data_source=data_source,
+            format=format,
+        )
+        if ddl_result.get("status") != "success":
+            return ddl_result
+ 
+        new_ddl = ddl_result.get("ddl")
+ 
+        synapse_connection_string = os.environ.get("SYNAPSE_CONNECTION_STRING")
+        if not synapse_connection_string:
+            raise ValueError(
+                "SYNAPSE_CONNECTION_STRING environment variable is not set."
+            )
+ 
+        conn = _connect_to_synapse(synapse_connection_string)
+ 
+        with conn:
+            with conn.cursor() as cursor:
+                logging.info(f"Executing DDL for: {table_name}")
+                # Split and execute script
+                ddl_statements = [
+                    statement.strip()
+                    for statement in new_ddl.split(";")
+                    if statement.strip()
+                ]
+                for statement in ddl_statements:
+                    cursor.execute(statement)
+                conn.commit()
+                logging.info(f"Successfully executed DDL for {table_name}.")
+ 
+                # If the table name ends with '_all', create a second view for current records
+                if table_name.endswith("_all"):
+                    current_view_name = table_name[:-4]
+                    logging.info(f"Creating 'current-only' view: {current_view_name}")
+ 
+                    source_parts = table_name.split(".")
+                    current_parts = current_view_name.split(".")
+ 
+                    full_source_view_name = (
+                        f"[{source_parts[0]}].[{source_parts[1]}]"
+                        if len(source_parts) == 2
+                        else f"[{table_name}]"
+                    )
+                    full_current_view_name = (
+                        f"[{current_parts[0]}].[{current_parts[1]}]"
+                        if len(current_parts) == 2
+                        else f"[{current_view_name}]"
+                    )
+ 
+                    current_view_ddl = f"""
+                    CREATE OR ALTER VIEW {full_current_view_name} AS
+                    SELECT *
+                    FROM {full_source_view_name}
+                    WHERE [current] = 1;
+                    """
+                    cursor.execute(current_view_ddl)
+                    conn.commit()
+                    logging.info(
+                        f"Successfully created 'current-only' view: {current_view_name}"
+                    )
+ 
+        return {"status": "success", "message": "DDL executed successfully."}
+ 
+    except Exception as e:
+        logger.error(f"Unexpected error during DDL execution: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+ 
+ 
+def _connect_to_synapse(connection_string: str) -> "pyodbc.Connection":
+    """
+    Connects to Synapse serverless SQL pool using a unified token-based method.
+    Works for both local dev (`az login`) and deployed (`Managed Identity`).
+    """
+    import pyodbc
+    import struct
+    from azure.identity import DefaultAzureCredential
+ 
+    logging.info("Connecting to Synapse using unified token authentication.")
+    credential = DefaultAzureCredential()
+    token_credential = credential.get_token("https://database.windows.net/.default")
+    token_bytes = token_credential.token.encode("UTF-16-LE")
+    token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
+    SQL_COPT_SS_ACCESS_TOKEN = 1256
+    return pyodbc.connect(
+        connection_string, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct}
+    )
+ 
+ 
